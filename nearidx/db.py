@@ -13,11 +13,23 @@ text, never rebuilt from tokens.  A document's text and its postings are bound
 through ``text_sha256`` and ``postings_digest``; replacing the content without
 calling :meth:`Index.rebuild_document` is detected by :meth:`Index.verify`
 (and by the source-file check when a document was loaded from a file).
+
+Generations
+-----------
+A batch refresh (:func:`nearidx.refresh.refresh_index`) never edits the main
+file in place: it builds the new generation as a complete sibling file and
+swaps it in with atomic renames, journaled in ``INDEX.generations.json``.
+The previous main file is kept as ``INDEX.gen-<N>`` so pagination cursors
+issued against it keep reading their original generation; the registry
+controls how many old generations are retained (current + two by default).
+``recover_generations`` runs on every open and resolves an interrupted
+publish to either the complete old or the complete new generation.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import time
@@ -26,13 +38,19 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .lexer import token_spans
+from .query import GenerationExpiredError
 
 SCHEMA_VERSION = 1
 FINGERPRINT_VERSION = "nearidx-fingerprint-v1"
 DEFAULT_MAX_DOC_CHARS = 32_000_000
+#: How many *old* generations a refresh keeps next to the current one.
+#: The current generation is always served; at least one old generation must
+#: be retained so in-flight pagination survives a publish.
+DEFAULT_RETAIN_OLD = 2
 
 __all__ = [
     "Document",
+    "GenerationInfo",
     "Index",
     "IndexErrorBase",
     "IndexExistsError",
@@ -41,6 +59,7 @@ __all__ = [
     "BuildReport",
     "build_index",
     "open_index",
+    "recover_generations",
     "text_sha256",
 ]
 
@@ -152,30 +171,43 @@ def _meta(conn: sqlite3.Connection) -> Dict[str, str]:
     return {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
 
 
-def build_index(
-    path: os.PathLike | str,
+def _fsync_file(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _write_index_file(
+    tmp: Path,
     docs: Iterable[Document | Tuple[str, str]],
     *,
-    name: Optional[str] = None,
-    overwrite: bool = False,
+    name: str,
+    index_id: str,
+    generation: int,
+    created_utc: str,
     max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
-) -> BuildReport:
-    """Build a fresh index file atomically.
+) -> Tuple[int, int, str]:
+    """Write a complete, self-contained index file for one generation.
 
-    Duplicate ``doc_id`` values are rejected, empty documents are allowed
-    (they simply have no postings), and every text is tokenised with the same
-    lexer used for queries.  The file is written to a sibling temporary file
-    and renamed into place, so a failed build never leaves a half index.
+    Shared by :func:`build_index` (generation 1) and the batch refresh
+    (generation N+1).  Returns ``(doc_count, token_count, fingerprint)``.
+    On any error the temporary file is removed and nothing is left behind.
     """
-    started = time.monotonic()
-    target = Path(path)
-    if target.exists() and not overwrite:
-        raise IndexExistsError(f"{target} already exists (pass overwrite=True)")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{target.name}.build-{os.getpid()}-{time.time_ns()}.tmp")
-    if tmp.exists():
-        tmp.unlink()
-
     conn = _connect_build(tmp)
     doc_count = 0
     total_tokens = 0
@@ -240,20 +272,17 @@ def build_index(
             fingerprint_rows.append((doc.doc_id, sha, digest))
             doc_count += 1
             total_tokens += len(toks)
-        index_id = hashlib.sha256(
-            f"{time.time_ns()}:{os.getpid()}:{doc_count}".encode("ascii")
-        ).hexdigest()[:16]
         fingerprint = _fingerprint(fingerprint_rows)
         meta = {
             "schema_version": str(SCHEMA_VERSION),
             "fingerprint_version": FINGERPRINT_VERSION,
             "index_id": index_id,
-            "name": name or target.stem,
-            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "name": name,
+            "created_utc": created_utc,
             "doc_count": str(doc_count),
             "token_count": str(total_tokens),
             "index_fingerprint": fingerprint,
-            "generation": "1",
+            "generation": str(generation),
         }
         conn.executemany("INSERT INTO meta(key, value) VALUES (?,?)", meta.items())
         conn.execute("COMMIT")
@@ -271,7 +300,51 @@ def build_index(
             pass
         raise
     conn.close()
+    return doc_count, total_tokens, fingerprint
+
+
+def build_index(
+    path: os.PathLike | str,
+    docs: Iterable[Document | Tuple[str, str]],
+    *,
+    name: Optional[str] = None,
+    overwrite: bool = False,
+    max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
+) -> BuildReport:
+    """Build a fresh index file atomically.
+
+    Duplicate ``doc_id`` values are rejected, empty documents are allowed
+    (they simply have no postings), and every text is tokenised with the same
+    lexer used for queries.  The file is written to a sibling temporary file
+    and renamed into place, so a failed build never leaves a half index.
+    Building over an existing path discards any retained generations of the
+    previous index: it is a brand-new index, not a new generation.
+    """
+    started = time.monotonic()
+    target = Path(path)
+    if target.exists() and not overwrite:
+        raise IndexExistsError(f"{target} already exists (pass overwrite=True)")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.build-{os.getpid()}-{time.time_ns()}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    index_id = hashlib.sha256(
+        f"{time.time_ns()}:{os.getpid()}".encode("ascii")
+    ).hexdigest()[:16]
+    created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    doc_count, total_tokens, fingerprint = _write_index_file(
+        tmp,
+        docs,
+        name=name or target.stem,
+        index_id=index_id,
+        generation=1,
+        created_utc=created_utc,
+        max_doc_chars=max_doc_chars,
+    )
     os.replace(tmp, target)
+    _discard_generation_state(target)
+    _fsync_dir(target.parent)
     return BuildReport(
         path=str(target),
         doc_count=doc_count,
@@ -279,6 +352,248 @@ def build_index(
         index_fingerprint=fingerprint,
         elapsed_seconds=time.monotonic() - started,
     )
+
+
+# ---------------------------------------------------------------------------
+# generation registry, crash recovery and retention
+# ---------------------------------------------------------------------------
+#
+# Layout next to the index file ``INDEX``:
+#
+# ``INDEX``                    the current generation (a complete index file)
+# ``INDEX.gen-<N>``            a retained old generation (complete index file)
+# ``INDEX.generations.json``   the registry: current pointer, retained list,
+#                              retention setting and the publish journal
+#
+# A refresh never mutates the main file in place.  It builds the new
+# generation as a complete file, journals a ``pending`` entry in the
+# registry, then performs two atomic renames (old main aside, new main in)
+# and finally clears the journal.  ``recover_generations`` resolves any
+# interrupted publish the next time the index is opened, so a reopen always
+# sees either the complete old generation or the complete new one.
+
+
+def _registry_path(path: Path) -> Path:
+    return path.with_name(path.name + ".generations.json")
+
+
+def _gen_file_name(path: Path, generation: int) -> str:
+    return f"{path.name}.gen-{generation}"
+
+
+def _gen_file_path(path: Path, generation: int) -> Path:
+    return path.with_name(_gen_file_name(path, generation))
+
+
+def _read_registry(path: Path) -> Optional[Dict[str, object]]:
+    reg_path = _registry_path(Path(path))
+    try:
+        raw = reg_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    return data
+
+
+def _write_registry(path: Path, data: Dict[str, object]) -> None:
+    reg_path = _registry_path(Path(path))
+    tmp = reg_path.with_name(
+        f".{reg_path.name}.{os.getpid()}-{time.time_ns()}.tmp"
+    )
+    tmp.write_bytes(json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
+    _fsync_file(tmp)
+    os.replace(tmp, reg_path)
+    _fsync_dir(reg_path.parent)
+
+
+def _read_main_meta(path: Path) -> Optional[Dict[str, str]]:
+    """Meta of the main index file, or None when the file is missing.
+
+    A file that exists but is not a readable nearidx database is reported via
+    a sentinel so recovery leaves an unknown state untouched instead of
+    making it worse.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(
+            f"file:{p.resolve().as_posix()}?mode=ro", uri=True,
+            isolation_level=None,
+        )
+        try:
+            return _meta(conn)
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return {"__corrupt__": "1"}
+
+
+def _trim_retained(
+    retained: List[Dict[str, object]], keep: int
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Split the retained list into the entries kept and the ones dropped."""
+    kept = list(retained[:keep])
+    dropped = list(retained[keep:])
+    return kept, dropped
+
+
+def _drop_retained_files(path: Path, entries: Iterable[Dict[str, object]]) -> None:
+    for entry in entries:
+        fname = entry.get("file")
+        if not isinstance(fname, str) or not fname:
+            continue
+        candidate = Path(path).with_name(fname)
+        # Only ever unlink derived generation files of this index.
+        if candidate.name.startswith(f"{Path(path).name}.gen-"):
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+
+
+def _cleanup_orphans(path: Path, reg: Optional[Dict[str, object]]) -> None:
+    """Remove leftover temp files and unreferenced generation files.
+
+    A generation file that no registry entry (retained or pending) points at
+    is unpublished data; it must never be served, so it is deleted.  Only
+    runs from the writer/recovery path, never on a plain read-only open.
+    """
+    path = Path(path)
+    name = path.name
+    referenced = set()
+    if reg:
+        for entry in reg.get("retained", []) or []:
+            if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+                referenced.add(entry["file"])
+        pending = reg.get("pending")
+        if isinstance(pending, dict) and isinstance(pending.get("generation"), int):
+            referenced.add(_gen_file_name(path, pending["generation"]))
+    try:
+        children = list(path.parent.iterdir())
+    except OSError:
+        return
+    for child in children:
+        n = child.name
+        if n.startswith(f".{name}.") and n.endswith(".tmp"):
+            try:
+                child.unlink()
+            except OSError:
+                pass
+        elif (
+            n.startswith(f"{name}.gen-")
+            and n[len(name) + 5:].isdigit()
+            and n not in referenced
+        ):
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+
+def recover_generations(path: os.PathLike | str) -> None:
+    """Resolve an interrupted publish, if one is journaled.
+
+    After this returns, the main file is either the complete old generation
+    or the complete new one, and the registry matches reality.  It is a no-op
+    when the index was never refreshed or the last publish completed.
+    """
+    path = Path(path)
+    reg = _read_registry(path)
+    if reg is None:
+        return
+    pending = reg.get("pending")
+    if not isinstance(pending, dict):
+        return
+    new_gen = pending.get("generation")
+    new_fp = pending.get("fingerprint")
+    from_gen = pending.get("from_generation")
+    from_fp = pending.get("from_fingerprint")
+    if not all(isinstance(v, (int, str)) for v in (new_gen, new_fp, from_gen, from_fp)):
+        # A journal we cannot understand: leave everything untouched.
+        return
+    main = _read_main_meta(path)
+    if main is not None and "__corrupt__" in main:
+        return
+    if (
+        main is not None
+        and main.get("generation") == str(new_gen)
+        and main.get("index_fingerprint") == new_fp
+    ):
+        # The new generation was installed but the registry was never
+        # finalised: roll forward.
+        retained: List[Dict[str, object]] = []
+        if _gen_file_path(path, int(from_gen)).is_file():
+            retained.append(
+                {
+                    "generation": int(from_gen),
+                    "fingerprint": from_fp,
+                    "file": _gen_file_name(path, int(from_gen)),
+                }
+            )
+        for entry in reg.get("retained", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            g = entry.get("generation")
+            if isinstance(g, int) and g != int(from_gen) and g < int(new_gen):
+                retained.append(entry)
+        keep = reg.get("retain_old", DEFAULT_RETAIN_OLD)
+        if not isinstance(keep, int) or keep < 1:
+            keep = DEFAULT_RETAIN_OLD
+        kept, dropped = _trim_retained(retained, keep)
+        reg["current"] = {"generation": int(new_gen), "fingerprint": new_fp}
+        reg["retained"] = kept
+        reg["pending"] = None
+        _write_registry(path, reg)
+        _drop_retained_files(path, dropped)
+        stray = _gen_file_path(path, int(new_gen))
+        if stray.exists():
+            try:
+                stray.unlink()
+            except OSError:
+                pass
+    else:
+        # The publish never completed: the main file is still the old
+        # generation (or was moved aside), so roll back to it.
+        if main is None:
+            old_file = _gen_file_path(path, int(from_gen))
+            if old_file.is_file():
+                os.replace(old_file, path)
+                _fsync_dir(path.parent)
+        staged = _gen_file_path(path, int(new_gen))
+        if staged.exists():
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        reg["pending"] = None
+        _write_registry(path, reg)
+    _cleanup_orphans(path, reg)
+
+
+def _discard_generation_state(path: Path) -> None:
+    """Remove registry and retained generations (fresh build over a path)."""
+    reg = _read_registry(path)
+    _cleanup_orphans(path, reg)
+    try:
+        _registry_path(path).unlink()
+    except OSError:
+        pass
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationInfo:
+    """One retained generation of an index."""
+
+    generation: int
+    fingerprint: str
+    path: str
+    current: bool
 
 
 # ---------------------------------------------------------------------------
@@ -318,10 +633,16 @@ class AccessTrace:
 
 
 class Index:
-    """A read-only handle on a built index, safe to reopen in another process."""
+    """A read-only handle on a built index, safe to reopen in another process.
+
+    The handle always serves the generation that was current when it was
+    opened.  :meth:`for_generation` resolves older retained generations for
+    pagination cursors that were issued before a refresh was published.
+    """
 
     def __init__(self, path: os.PathLike | str, *, trace: Optional[AccessTrace] = None):
         self.path = Path(path)
+        recover_generations(self.path)
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
         uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
@@ -342,7 +663,9 @@ class Index:
         self.name = meta.get("name", self.path.stem)
         self.index_id = meta["index_id"]
         self.fingerprint = meta["index_fingerprint"]
+        self.generation = int(meta.get("generation", "1"))
         self.trace = trace
+        self._gen_cache: Dict[str, "Index"] = {}
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -351,6 +674,12 @@ class Index:
 
     # -- lifecycle -------------------------------------------------------
     def close(self) -> None:
+        for sub in self._gen_cache.values():
+            try:
+                sub.close()
+            except sqlite3.Error:
+                pass
+        self._gen_cache.clear()
         self._conn.close()
 
     def __enter__(self) -> "Index":
@@ -361,6 +690,103 @@ class Index:
 
     def _t(self) -> Optional[AccessTrace]:
         return self.trace
+
+    # -- generations -----------------------------------------------------
+    def generations(self) -> List[GenerationInfo]:
+        """The current generation plus every retained old generation."""
+        infos = [
+            GenerationInfo(
+                generation=self.generation,
+                fingerprint=self.fingerprint,
+                path=str(self.path),
+                current=True,
+            )
+        ]
+        reg = _read_registry(self.path)
+        if reg:
+            for entry in reg.get("retained", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                g = entry.get("generation")
+                fp = entry.get("fingerprint")
+                fname = entry.get("file")
+                if not isinstance(g, int) or not isinstance(fp, str):
+                    continue
+                if not isinstance(fname, str) or not fname:
+                    fname = _gen_file_name(self.path, g)
+                infos.append(
+                    GenerationInfo(
+                        generation=g,
+                        fingerprint=fp,
+                        path=str(self.path.with_name(fname)),
+                        current=False,
+                    )
+                )
+        return infos
+
+    def for_generation(self, index_sig: str) -> "Index":
+        """Resolve the generation a pagination cursor was issued against.
+
+        Returns this handle when the cursor's fingerprint is the generation
+        the handle itself serves (an open handle pins its generation).
+        Otherwise the registry is consulted on every call: the current
+        generation is reopened from the main path, a retained old generation
+        is opened (and cached) from its generation file, and anything else
+        raises :class:`GenerationExpiredError` -- a cursor whose generation
+        fell out of retention is never silently served current data.
+        """
+        if index_sig == self.fingerprint:
+            return self
+        reg = _read_registry(self.path)
+        target_path: Optional[Path] = None
+        if reg:
+            current = reg.get("current")
+            if (
+                isinstance(current, dict)
+                and current.get("fingerprint") == index_sig
+                and isinstance(current.get("generation"), int)
+                and current["generation"] != self.generation
+            ):
+                # The registry still points at the current generation, but
+                # this handle was opened before it was published: reopen the
+                # main path to see it.
+                target_path = self.path
+            if target_path is None:
+                for entry in reg.get("retained", []) or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("fingerprint") != index_sig:
+                        continue
+                    fname = entry.get("file")
+                    if isinstance(fname, str) and fname:
+                        target_path = self.path.with_name(fname)
+                    elif isinstance(entry.get("generation"), int):
+                        target_path = _gen_file_path(self.path, entry["generation"])
+                    break
+        if target_path is None:
+            raise GenerationExpiredError(
+                f"index generation with fingerprint {index_sig[:12]}... is no "
+                "longer retained (it expired or never existed); pagination "
+                "cannot continue -- start a new search"
+            )
+        cached = self._gen_cache.get(index_sig)
+        if cached is not None:
+            return cached
+        try:
+            sub = Index(target_path)
+        except (FileNotFoundError, IndexFormatError) as exc:
+            raise GenerationExpiredError(
+                f"retained generation file for fingerprint {index_sig[:12]}... "
+                f"is unavailable: {exc}"
+            ) from exc
+        if sub.fingerprint != index_sig:
+            sub.close()
+            raise GenerationExpiredError(
+                f"index generation with fingerprint {index_sig[:12]}... is no "
+                "longer retained; pagination cannot continue"
+            )
+        self._gen_cache[index_sig] = sub
+        return sub
 
     def stats(self) -> Dict[str, object]:
         row = self._conn.execute(
@@ -376,6 +802,10 @@ class Index:
             "index_id": self.index_id,
             "fingerprint": self.fingerprint,
             "name": self.name,
+            "generation": self.generation,
+            "retained_generations": [
+                g.generation for g in self.generations() if not g.current
+            ],
         }
 
     # -- documents -------------------------------------------------------
@@ -451,13 +881,16 @@ class Index:
 
     # -- integrity / binding --------------------------------------------
     def verify(
-        self, *, full: bool = True, sample: int = 0, check_sources: bool = True
+        self, *, full: bool = True, sample: int = 0, check_sources: bool = True,
+        generations: bool = False,
     ) -> List[str]:
         """Check structural and content binding.
 
         ``full`` re-tokenises every stored text and recomputes its posting
         digest, so a database whose text was swapped without rebuild is
-        reported.  Returns a list of problem strings (empty means OK).
+        reported.  With ``generations=True`` every retained old generation is
+        checked against its registered fingerprint the same way.  Returns a
+        list of problem strings (empty means OK).
         """
         problems: List[str] = []
         quick = self._conn.execute("PRAGMA quick_check").fetchone()
@@ -514,6 +947,62 @@ class Index:
         expected_fp = _fingerprint(fp_rows)
         if expected_fp != meta.get("index_fingerprint"):
             problems.append("index fingerprint does not match document set")
+        if generations:
+            problems.extend(self._verify_retained(full=full, sample=sample,
+                                                  check_sources=check_sources))
+        return problems
+
+    def _verify_retained(
+        self, *, full: bool, sample: int, check_sources: bool
+    ) -> List[str]:
+        """Verify every retained old generation against the registry."""
+        problems: List[str] = []
+        reg = _read_registry(self.path)
+        if reg is None:
+            return problems
+        seen_files = set()
+        for entry in reg.get("retained", []) or []:
+            if not isinstance(entry, dict):
+                problems.append("registry: malformed retained entry")
+                continue
+            g = entry.get("generation")
+            fp = entry.get("fingerprint")
+            fname = entry.get("file")
+            label = f"generation {g}"
+            if not isinstance(g, int) or not isinstance(fp, str):
+                problems.append("registry: retained entry missing generation "
+                                "or fingerprint")
+                continue
+            if not isinstance(fname, str) or not fname:
+                fname = _gen_file_name(self.path, g)
+            if fname in seen_files:
+                problems.append(f"{label}: duplicate retained file {fname}")
+                continue
+            seen_files.add(fname)
+            gpath = self.path.with_name(fname)
+            if not gpath.is_file():
+                problems.append(f"{label}: retained file {fname} is missing")
+                continue
+            try:
+                sub = Index(gpath)
+            except (FileNotFoundError, IndexFormatError) as exc:
+                problems.append(f"{label}: cannot open retained file: {exc}")
+                continue
+            try:
+                if sub.generation != g:
+                    problems.append(
+                        f"{label}: file reports generation {sub.generation}"
+                    )
+                if sub.fingerprint != fp:
+                    problems.append(
+                        f"{label}: registry fingerprint does not match file"
+                    )
+                for problem in sub.verify(
+                    full=full, sample=sample, check_sources=check_sources
+                ):
+                    problems.append(f"{label}: {problem}")
+            finally:
+                sub.close()
         return problems
 
     def check_source(self, doc_id: str, *, path: Optional[str] = None,
@@ -580,15 +1069,19 @@ def rebuild_document(
 ) -> str:
     """Replace one document's text and postings in place, atomically.
 
-    This is the only supported way to change document content.  The index
-    fingerprint changes, so pagination cursors issued against the old content
-    are rejected instead of silently skipping or duplicating windows.
+    This is the single-document repair path; for a batch of changes use
+    :func:`nearidx.refresh.refresh_index`, which publishes a new generation
+    and keeps the old one queryable.  The in-place rebuild changes the index
+    fingerprint without retaining the old generation, so pagination cursors
+    issued against the old content are rejected instead of silently skipping
+    or duplicating windows.
     """
     from .lexer import token_spans as _spans
 
     if not isinstance(text, str):
         raise ValueError("text must be str")
     target = Path(path)
+    recover_generations(target)
     conn = sqlite3.connect(str(target), isolation_level=None)
     conn.execute("PRAGMA foreign_keys = OFF")
     try:

@@ -559,10 +559,13 @@ def search(
     """Run *root* over the index and return one deterministic page.
 
     Ordering is fixed: doc_id, start, end.  A cursor encodes the offset, page
-    size, query signature and index fingerprint, so pages issued for a
-    different query or a different index state are rejected rather than
-    silently skipping/duplicating windows.  The data set is immutable during
-    pagination; there is no live-update reconciliation.
+    size, query signature and the fingerprint of the index generation the
+    first page was served from.  Follow-up pages are resolved against that
+    exact generation -- even after a refresh published a newer one and the
+    index was reopened in another process -- so a paginating reader finishes
+    the generation it started, with the original windows, order and page
+    boundaries.  A cursor whose generation is no longer retained raises
+    :class:`GenerationExpiredError` instead of silently reading current data.
     """
     if limit < 1:
         raise QueryError("limit must be at least 1")
@@ -571,11 +574,11 @@ def search(
         cur = decode_cursor(cursor)
         if cur.query_sig != signature:
             raise CursorError("cursor was issued for a different query")
-        if cur.index_sig != index.fingerprint:
-            raise CursorError(
-                "cursor was issued for a different index state "
-                "(rebuilds invalidate cursors)"
-            )
+        # Bind the whole call to the cursor's generation.  ``for_generation``
+        # returns the handle itself when the cursor names the generation this
+        # handle already serves, so every read below stays inside one
+        # generation's file from candidate lookup to snippet slicing.
+        index = index.for_generation(cur.index_sig)
         offset = cur.offset
         limit = cur.page_size
     if offset < 0:

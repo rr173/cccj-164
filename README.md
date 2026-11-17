@@ -10,12 +10,13 @@ python3 -m nearidx search demo.nearidx 'NEAR(3,[pump,pump])' --limit 5
 python3 -m nearidx snippet demo.nearidx d1 --positions 0:2
 python3 -m nearidx verify demo.nearidx --full
 python3 -m nearidx rebuild demo.nearidx d1 --file docs/d1.txt
+python3 -m nearidx refresh demo.nearidx batch.jsonl --retain-old 2
 ```
 
 Python API：
 
 ```python
-from nearidx import build_index, open_index, parse_query, search
+from nearidx import build_index, open_index, parse_query, refresh_index, search
 
 build_index("demo.nearidx", [("d1", "pump valve pump")], overwrite=True)
 with open_index("demo.nearidx") as idx:
@@ -27,7 +28,7 @@ with open_index("demo.nearidx") as idx:
 运行测试与演示：
 
 ```bash
-python3 -m unittest discover -s nearidx/tests -t .   # 47 个测试
+python3 -m unittest discover -s nearidx/tests -t .   # 84 个测试
 python3 -m nearidx.factcheck                         # 主例与嵌套例的落盘演示
 python3 examples/scale_demo.py 2000                   # 大量无关文档 + 访问证据
 ```
@@ -86,6 +87,8 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 
 `postings` 就是落盘倒排词位表；原文只存一份，索引文件和正文绑定在同一 SQLite 文件里，切开也自包含。
 
+批量刷新发布的每个旧代都是同样自包含的完整索引文件（`INDEX.gen-<N>`），由 `INDEX.generations.json` 登记；当前代始终是 `INDEX` 本身。
+
 ### 正文与索引的绑定
 
 - 每篇文档的内容摘要 `text_sha256` 和其倒排行的 `postings_digest` 都记录在 `documents` 上，整体再合成 `index_fingerprint`。
@@ -113,10 +116,28 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 
 - `limit`/`offset` 直接分页；也可用 `cursor`。
 - 后续页顺序固定为 `doc_id, start, end`，页间不重复、不丢失（测试用 `limit=1,2,3` 逐页拼接后与一次性大页做全量对比）。
-- 游标里带 `offset`、`page_size`、查询签名和索引指纹：
+- 游标里带 `offset`、`page_size`、查询签名和**索引代指纹**：
   - 换查询 → 报 `CursorError`；
-  - 期间发生 `rebuild_document`（指纹变化）→ 报 `CursorError`，而不是静默跳过/重复。
-- 数据固定，不要求实时更新期间的分页一致性；显式重建会使旧游标失效。
+  - 无游标的第一页绑定开始查询时的索引代；它返回的后续游标继续指向**同一代**，而不是每次翻页时重新指向当前代。旧代仍保留时，旧游标跨进程、跨重开都继续看到原文、原命中顺序和原分页边界；
+  - 旧代已被清理（超出保留范围）→ 报 `GenerationExpiredError`（`CursorError` 的子类），绝不静默改查当前代；
+  - 期间发生 `rebuild_document`（原地改写，不保留旧代）→ 同样报错失效。
+
+## 批量刷新（代际发布）
+
+`nearidx refresh INDEX MANIFEST.jsonl` 把一整批审核变更发布为一个新索引代；Python 侧对应 `refresh_index(path, manifest, retain_old=...)`。清单是 JSON Lines，每行一项操作：
+
+```jsonl
+{"op":"upsert","doc_id":"d1","text":"新正文"}
+{"op":"upsert","doc_id":"d2","path":"docs/d2.txt"}
+{"op":"delete","doc_id":"d3"}
+```
+
+- `upsert` 必须且只能提供 `text` 或 `path`；`delete` 只带 `doc_id`。新增与替换同用一个 `upsert`。
+- 同一批次中同一 `doc_id` 只能出现一次；删除不存在的文档、坏 JSON、无法读取或解码的来源、重复 ID、未知操作/字段都**拒绝整批**——所有校验和来源读取都在任何文件改动之前完成，失败时当前索引与进行中的分页保持原样。
+- 成功批次作为一个新代发布：新内容先构建为完整索引文件，写入 `pending` 日志后经两次原子 rename 换入，返回新代号与指纹。发布期间进程被杀，重开时 `recover_generations`（每次打开都会运行）只会恢复出**完整的旧代或完整的新代**；未发布的孤立文件永远不会被当成当前代。
+- 旧代以 `INDEX.gen-<N>` 完整文件保留，由 `INDEX.generations.json` 登记。`--retain-old N`（持久化在注册表里）控制保留多少个旧代：默认保留当前代及最近两个旧代，最少必须保留一个旧代；超出保留范围的代文件被清理，对应游标报过期。
+- 一个 `Index` 句柄始终服务它打开时的那一代；要看新代请重新 `open_index`。`idx.generations()` 列出当前代与所有保留代，`idx.verify(full=True, generations=True)`（CLI `verify --full --generations`）会逐代校验数据与指纹绑定。
+- 与 `rebuild_document` 的区别：单篇重建仍是原地原子替换、使旧游标失效；批量刷新才发布新代并保留旧代。`build_index(overwrite=True)` 是全新索引，会丢弃上一代际状态。
 
 ## 模块
 
@@ -124,12 +145,14 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 | --- | --- |
 | `nearidx/lexer.py` | 固定词法、casefold、字符/字节跨度、查询 token 校验 |
 | `nearidx/query.py` | 查询 AST、解析器、先序叶编号、序列化/签名、分页游标 |
-| `nearidx/db.py` | 建库、schema、只读打开、倒排访问、完整性校验、显式重建 |
+| `nearidx/db.py` | 建库、schema、只读打开、倒排访问、完整性校验、显式重建、代际注册表与崩溃恢复 |
+| `nearidx/refresh.py` | 清单解析/校验、整批发布为新索引代、保留清理 |
 | `nearidx/solver.py` | 需求组候选、候选窗口驱动求解、根最小窗口、分页 |
-| `nearidx/cli.py` | `build/search/snippet/stats/verify/rebuild` |
+| `nearidx/cli.py` | `build/search/snippet/stats/verify/rebuild/refresh` |
 | `nearidx/factcheck.py` | 可执行的主例/嵌套例演示 |
 | `nearidx/tests/oracle.py` | 独立暴力 oracle：枚举每个叶的所有词位分配后按公开规则筛选 |
-| `nearidx/tests/test_semantics.py` | 47 个测试（含随机化差分测试） |
+| `nearidx/tests/test_semantics.py` | 47 个语义测试（含随机化差分测试） |
+| `nearidx/tests/test_refresh.py` | 37 个批量刷新测试：代际发布、游标绑定、保留清理、崩溃恢复 |
 | `examples/scale_demo.py` | 大量无关文档下的访问证据与超小分页演示 |
 
 ## 测试覆盖
@@ -138,6 +161,7 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 - 大小写折叠（含 `ß`→`ss`）、重复词、重复子树、重叠子区间但词位不交、内部同区间多见证、兄弟冲突时保留另一见证、根最小窗口、唯一见证决胜（未使用叶 `-1` 参与字典序）。
 - 空文档、纯分隔符文档、多字节来源切片（emoji + 非 ASCII）。
 - 超小分页（1/2/3）、游标拒绝换查询与重建。
+- 批量刷新：新增/替换/删除同批发布；旧游标跨重开、跨进程读完原代；无效批次整批拒绝且索引不变；保留代清理后旧游标报过期；发布在每一步被杀后恢复为完整旧代或新代；单篇重建与普通查询行为不变。
 - 新进程 `python -I` 重开索引并查询。
 - 篡改正文/倒排检测、来源文件变动的显式报错、显式重建后的重新绑定。
 - 独立 oracle：固定小文本 × 固定查询集合、随机文本 × 随机查询树（150 组），同时对比**原始命中**与**根窗口**；另对根窗口线性选择做 200 组随机 O(n²) 交叉校验。
@@ -146,5 +170,6 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 ## 已知边界
 
 - 单个中间节点的部分命中数超过 `max_hits`（默认 2,000,000）会抛 `SolverLimitError`，提示收窄查询；不做静默截断。
-- 分页游标不是“快照句柄”：它只校验查询与索引指纹，不支持数据在分页期间变化后继续旧序列。
-- 未实现并发写；`rebuild_document` 使用 `BEGIN IMMEDIATE` 做单次原子替换，构建走临时文件 + 原子 rename。
+- 分页游标绑定一个索引代：该代仍保留时可跨进程续翻；被清理后报 `GenerationExpiredError`。游标不是“快照句柄”之外的实时同步机制，`rebuild_document` 原地改写仍使旧游标失效。
+- 未实现并发写：`rebuild_document` 使用 `BEGIN IMMEDIATE` 做单次原子替换，构建走临时文件 + 原子 rename，批量刷新走完整新文件 + 日志 + 原子 rename；崩溃恢复假设没有另一个写者同时进行（恢复无法区分“崩溃的发布”和“进行中的发布”）。
+- 批量刷新按整库构建新代文件，发布成本随语料大小线性增长；换来的是发布与恢复路径完全复用构建逻辑。

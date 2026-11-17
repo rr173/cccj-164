@@ -297,6 +297,24 @@ class CursorError(ValueError):
     pass
 
 
+class GenerationExpiredError(CursorError):
+    """The cursor's index generation is no longer retained.
+
+    Raised instead of silently re-running the query against the current
+    generation, so a paginating client never sees skipped, duplicated or
+    mixed-generation windows.
+    """
+
+
+class GenerationExpiredError(CursorError):
+    """The cursor's index generation is no longer retained.
+
+    Raised instead of silently re-running the query against the current
+    generation, so a paginating client never sees skipped, duplicated or
+    mixed-generation windows.
+    """
+
+
 def encode_cursor(
     offset: int, page_size: int, signature: str, index_sig: str
 ) -> str:

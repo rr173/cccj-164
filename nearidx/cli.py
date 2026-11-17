@@ -1,4 +1,4 @@
-"""Command line interface: build, search, snippet, stats, verify, rebuild.
+"""Command line interface: build, search, snippet, stats, verify, rebuild, refresh.
 
 Examples
 --------
@@ -9,6 +9,7 @@ Examples
     python -m nearidx snippet corpus.nearidx d1 --char 0:15
     python -m nearidx verify corpus.nearidx --full
     python -m nearidx rebuild corpus.nearidx d1 --file docs/d1.txt
+    python -m nearidx refresh corpus.nearidx batch.jsonl --retain-old 2
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from .db import (
     text_sha256,
 )
 from .query import CursorError, QuerySyntaxError, parse_query, serialize_query
+from .refresh import ManifestError, refresh_index
 from .solver import QueryError, search
 
 
@@ -167,11 +169,29 @@ def cmd_stats(args: argparse.Namespace) -> int:
 def cmd_verify(args: argparse.Namespace) -> int:
     index = open_index(args.index, verify=False)
     try:
-        problems = index.verify(full=args.full)
+        problems = index.verify(full=args.full, generations=args.generations)
         _emit({"ok": not problems, "problems": problems})
         return 0 if not problems else 1
     finally:
         index.close()
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    try:
+        report = refresh_index(
+            args.index, args.manifest, retain_old=args.retain_old
+        )
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"index error: {exc}\n")
+        return 2
+    except ManifestError as exc:
+        sys.stderr.write(f"manifest error: {exc}\n")
+        return 2
+    except ValueError as exc:
+        sys.stderr.write(f"refresh error: {exc}\n")
+        return 2
+    _emit(report.as_dict())
+    return 0
 
 
 def cmd_rebuild(args: argparse.Namespace) -> int:
@@ -224,6 +244,11 @@ def build_parser() -> argparse.ArgumentParser:
     v = sub.add_parser("verify", help="check text/posting binding")
     v.add_argument("index")
     v.add_argument("--full", action="store_true")
+    v.add_argument(
+        "--generations",
+        action="store_true",
+        help="also verify every retained old generation against the registry",
+    )
     v.set_defaults(func=cmd_verify)
 
     r = sub.add_parser("rebuild", help="explicitly replace one document")
@@ -231,6 +256,22 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("doc_id")
     r.add_argument("--file", required=True)
     r.set_defaults(func=cmd_rebuild)
+
+    rf = sub.add_parser(
+        "refresh",
+        help="validate a JSONL batch (upsert/delete) and publish it as one "
+        "new index generation",
+    )
+    rf.add_argument("index")
+    rf.add_argument("manifest", help="JSON Lines manifest: one op per line")
+    rf.add_argument(
+        "--retain-old",
+        type=int,
+        default=None,
+        help="old generations to keep queryable for in-flight cursors "
+        "(default: keep the registry setting, initially 2; minimum 1)",
+    )
+    rf.set_defaults(func=cmd_refresh)
     return p
 
 
