@@ -1,0 +1,643 @@
+"""SQLite persistence: schema, builder, reopen, integrity and explicit rebuild.
+
+Layout
+------
+``meta``       schema version, index id/name, fingerprint, build stats.
+``documents``  one row per document: original Unicode text, its UTF-8 SHA-256,
+               token count, and a digest over that document's posting rows.
+``postings``   one row per token occurrence: folded token key, doc_id, 0-based
+               position, original character span and UTF-8 byte span.
+
+The index file is self-contained: snippets are cut from the stored original
+text, never rebuilt from tokens.  A document's text and its postings are bound
+through ``text_sha256`` and ``postings_digest``; replacing the content without
+calling :meth:`Index.rebuild_document` is detected by :meth:`Index.verify`
+(and by the source-file check when a document was loaded from a file).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from .lexer import token_spans
+
+SCHEMA_VERSION = 1
+FINGERPRINT_VERSION = "nearidx-fingerprint-v1"
+DEFAULT_MAX_DOC_CHARS = 32_000_000
+
+__all__ = [
+    "Document",
+    "Index",
+    "IndexErrorBase",
+    "IndexExistsError",
+    "IndexFormatError",
+    "StaleSourceError",
+    "BuildReport",
+    "build_index",
+    "open_index",
+    "text_sha256",
+]
+
+
+class IndexErrorBase(Exception):
+    """Base class for index-level errors."""
+
+
+class IndexExistsError(IndexErrorBase):
+    pass
+
+
+class IndexFormatError(IndexErrorBase):
+    pass
+
+
+class StaleSourceError(IndexErrorBase):
+    """The original text no longer matches the digest recorded in the index."""
+
+
+def text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _postings_digest(rows: Iterable[Tuple[int, str, int, int, int, int]]) -> str:
+    h = hashlib.sha256()
+    for pos, norm, cs, ce, bs, be in rows:
+        h.update(f"{pos}\x1f{norm}\x1f{cs}\x1f{ce}\x1f{bs}\x1f{be}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _fingerprint(docs: Sequence[Tuple[str, str, str]]) -> str:
+    """Hash of (doc_id, text sha, postings digest) in code-point order."""
+    h = hashlib.sha256(FINGERPRINT_VERSION.encode("ascii") + b"\n")
+    for doc_id, sha, pd in sorted(docs, key=lambda d: d[0]):
+        h.update(f"{doc_id}\x1f{sha}\x1f{pd}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class Document:
+    doc_id: str
+    text: str
+    source_path: Optional[str] = None
+    source_sha256: Optional[str] = None
+
+    @staticmethod
+    def from_file(doc_id: str, path: os.PathLike | str) -> "Document":
+        p = Path(path)
+        raw = p.read_bytes()
+        text = raw.decode("utf-8")  # strict: no silent replacement
+        return Document(
+            doc_id=doc_id,
+            text=text,
+            source_path=str(p.resolve()),
+            source_sha256=hashlib.sha256(raw).hexdigest(),
+        )
+
+
+@dataclass(slots=True)
+class BuildReport:
+    path: str
+    doc_count: int
+    token_count: int
+    index_fingerprint: str
+    elapsed_seconds: float
+
+
+_SCHEMA_SQL = """
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE documents (
+    doc_id          TEXT PRIMARY KEY,
+    text            TEXT NOT NULL,
+    text_sha256     TEXT NOT NULL,
+    char_len        INTEGER NOT NULL,
+    byte_len        INTEGER NOT NULL,
+    token_count     INTEGER NOT NULL,
+    postings_digest TEXT NOT NULL,
+    source_path     TEXT,
+    source_sha256   TEXT
+);
+CREATE TABLE postings (
+    token      TEXT NOT NULL,
+    doc_id     TEXT NOT NULL,
+    pos        INTEGER NOT NULL,
+    char_start INTEGER NOT NULL,
+    char_end   INTEGER NOT NULL,
+    byte_start INTEGER NOT NULL,
+    byte_end   INTEGER NOT NULL,
+    PRIMARY KEY (token, doc_id, pos)
+) WITHOUT ROWID;
+CREATE INDEX postings_by_doc ON postings (doc_id, pos);
+"""
+
+
+def _connect_build(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.execute("PRAGMA journal_mode = OFF")
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA page_size = 4096")
+    return conn
+
+
+def _meta(conn: sqlite3.Connection) -> Dict[str, str]:
+    return {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
+
+
+def build_index(
+    path: os.PathLike | str,
+    docs: Iterable[Document | Tuple[str, str]],
+    *,
+    name: Optional[str] = None,
+    overwrite: bool = False,
+    max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
+) -> BuildReport:
+    """Build a fresh index file atomically.
+
+    Duplicate ``doc_id`` values are rejected, empty documents are allowed
+    (they simply have no postings), and every text is tokenised with the same
+    lexer used for queries.  The file is written to a sibling temporary file
+    and renamed into place, so a failed build never leaves a half index.
+    """
+    started = time.monotonic()
+    target = Path(path)
+    if target.exists() and not overwrite:
+        raise IndexExistsError(f"{target} already exists (pass overwrite=True)")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.build-{os.getpid()}-{time.time_ns()}.tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    conn = _connect_build(tmp)
+    doc_count = 0
+    total_tokens = 0
+    fingerprint_rows: List[Tuple[str, str, str]] = []
+    try:
+        conn.executescript(_SCHEMA_SQL)
+        conn.execute("BEGIN")
+        seen = set()
+        for item in docs:
+            if isinstance(item, Document):
+                doc = item
+            elif isinstance(item, tuple) and len(item) == 2:
+                doc_id, text = item
+                doc = Document(doc_id=doc_id, text=text)
+            else:
+                raise TypeError(
+                    "each document must be Document or a (doc_id, text) tuple"
+                )
+            if not isinstance(doc.doc_id, str) or doc.doc_id == "":
+                raise ValueError("doc_id must be a non-empty string")
+            if not isinstance(doc.text, str):
+                raise ValueError(f"document {doc.doc_id!r} text must be str")
+            if "\x00" in doc.text:
+                raise ValueError(f"document {doc.doc_id!r} contains NUL")
+            if len(doc.text) > max_doc_chars:
+                raise ValueError(
+                    f"document {doc.doc_id!r} has {len(doc.text)} chars, "
+                    f"limit is {max_doc_chars}"
+                )
+            if doc.doc_id in seen:
+                raise ValueError(f"duplicate doc_id {doc.doc_id!r}")
+            seen.add(doc.doc_id)
+            sha = text_sha256(doc.text)
+            toks = token_spans(doc.text)
+            rows = [
+                (t.pos, t.norm, t.char_start, t.char_end, t.byte_start, t.byte_end)
+                for t in toks
+            ]
+            digest = _postings_digest(rows)
+            conn.execute(
+                "INSERT INTO documents(doc_id, text, text_sha256, char_len, "
+                "byte_len, token_count, postings_digest, source_path, "
+                "source_sha256) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    doc.doc_id,
+                    doc.text,
+                    sha,
+                    len(doc.text),
+                    len(doc.text.encode("utf-8")),
+                    len(toks),
+                    digest,
+                    doc.source_path,
+                    doc.source_sha256,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO postings(token, doc_id, pos, char_start, char_end, "
+                "byte_start, byte_end) VALUES (?,?,?,?,?,?,?)",
+                [(t.norm, doc.doc_id, t.pos, t.char_start, t.char_end,
+                  t.byte_start, t.byte_end) for t in toks],
+            )
+            fingerprint_rows.append((doc.doc_id, sha, digest))
+            doc_count += 1
+            total_tokens += len(toks)
+        index_id = hashlib.sha256(
+            f"{time.time_ns()}:{os.getpid()}:{doc_count}".encode("ascii")
+        ).hexdigest()[:16]
+        fingerprint = _fingerprint(fingerprint_rows)
+        meta = {
+            "schema_version": str(SCHEMA_VERSION),
+            "fingerprint_version": FINGERPRINT_VERSION,
+            "index_id": index_id,
+            "name": name or target.stem,
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "doc_count": str(doc_count),
+            "token_count": str(total_tokens),
+            "index_fingerprint": fingerprint,
+            "generation": "1",
+        }
+        conn.executemany("INSERT INTO meta(key, value) VALUES (?,?)", meta.items())
+        conn.execute("COMMIT")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("ANALYZE")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        conn.close()
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    conn.close()
+    os.replace(tmp, target)
+    return BuildReport(
+        path=str(target),
+        doc_count=doc_count,
+        token_count=total_tokens,
+        index_fingerprint=fingerprint,
+        elapsed_seconds=time.monotonic() - started,
+    )
+
+
+# ---------------------------------------------------------------------------
+# read / reopen
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class AccessTrace:
+    """Evidence of what a query actually touched in the index.
+
+    ``candidate_docs`` are doc_ids returned by the inverted table for the
+    query's required tokens; ``docs_solved`` had postings loaded; ``body_reads``
+    lists doc_ids whose original text was fetched from ``documents`` (only
+    those that produced deliverable windows need it).
+    """
+
+    candidate_docs: int = 0
+    docs_considered: int = 0
+    docs_solved: int = 0
+    posting_rows_fetched: int = 0
+    postings_queries: int = 0
+    body_reads: List[str] = field(default_factory=list)
+    missing_token_docs: int = 0
+    pruned_by_leaf_count: int = 0
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "candidate_docs": self.candidate_docs,
+            "docs_considered": self.docs_considered,
+            "docs_solved": self.docs_solved,
+            "posting_rows_fetched": self.posting_rows_fetched,
+            "postings_queries": self.postings_queries,
+            "body_reads": list(self.body_reads),
+            "missing_token_docs": self.missing_token_docs,
+            "pruned_by_leaf_count": self.pruned_by_leaf_count,
+        }
+
+
+class Index:
+    """A read-only handle on a built index, safe to reopen in another process."""
+
+    def __init__(self, path: os.PathLike | str, *, trace: Optional[AccessTrace] = None):
+        self.path = Path(path)
+        if not self.path.is_file():
+            raise FileNotFoundError(self.path)
+        uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
+        try:
+            self._conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+            self._conn.execute("PRAGMA query_only = ON")
+            meta = _meta(self._conn)
+        except sqlite3.DatabaseError as exc:
+            raise IndexFormatError(
+                f"{self.path} is not a nearidx database: {exc}"
+            ) from exc
+        if meta.get("schema_version") != str(SCHEMA_VERSION):
+            raise IndexFormatError(
+                f"unsupported schema_version {meta.get('schema_version')!r} "
+                f"(expected {SCHEMA_VERSION})"
+            )
+        self.meta: Dict[str, str] = meta
+        self.name = meta.get("name", self.path.stem)
+        self.index_id = meta["index_id"]
+        self.fingerprint = meta["index_fingerprint"]
+        self.trace = trace
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Read-only connection for modules that build SQL themselves."""
+        return self._conn
+
+    # -- lifecycle -------------------------------------------------------
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> "Index":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _t(self) -> Optional[AccessTrace]:
+        return self.trace
+
+    def stats(self) -> Dict[str, object]:
+        row = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(token_count),0) FROM documents"
+        ).fetchone()
+        distinct = self._conn.execute(
+            "SELECT COUNT(DISTINCT token) FROM postings"
+        ).fetchone()[0]
+        return {
+            "doc_count": row[0],
+            "token_occurrences": row[1],
+            "distinct_tokens": distinct,
+            "index_id": self.index_id,
+            "fingerprint": self.fingerprint,
+            "name": self.name,
+        }
+
+    # -- documents -------------------------------------------------------
+    def doc_ids(self) -> List[str]:
+        return [r[0] for r in self._conn.execute(
+            "SELECT doc_id FROM documents ORDER BY doc_id"
+        )]
+
+    def doc_meta(self, doc_id: str) -> Optional[Dict[str, object]]:
+        row = self._conn.execute(
+            "SELECT doc_id, text_sha256, char_len, byte_len, token_count, "
+            "postings_digest, source_path, source_sha256 FROM documents "
+            "WHERE doc_id = ?",
+            (doc_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        keys = ("doc_id", "text_sha256", "char_len", "byte_len", "token_count",
+                "postings_digest", "source_path", "source_sha256")
+        return dict(zip(keys, row))
+
+    def text(self, doc_id: str) -> str:
+        """Fetch the original text.  Only called for documents that need it."""
+        row = self._conn.execute(
+            "SELECT text FROM documents WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(doc_id)
+        tr = self._t()
+        if tr is not None:
+            tr.body_reads.append(doc_id)
+        return row[0]
+
+    def snippet(self, doc_id: str, char_start: int, char_end: int) -> str:
+        """Cut the original span, no token re-joining."""
+        if char_start < 0 or char_end < char_start:
+            raise ValueError("invalid character span")
+        text = self.text(doc_id)
+        if char_end > len(text):
+            raise IndexFormatError(
+                f"span {char_start}:{char_end} exceeds document {doc_id!r}"
+            )
+        return text[char_start:char_end]
+
+    def token_spans(
+        self, doc_id: str, pos_start: int, pos_end: int
+    ) -> List[Tuple[int, int, int, int, int]]:
+        """Posting spans for a position range of one document."""
+        return self._conn.execute(
+            "SELECT pos, char_start, char_end, byte_start, byte_end FROM postings "
+            "WHERE doc_id = ? AND pos BETWEEN ? AND ? ORDER BY pos",
+            (doc_id, pos_start, pos_end),
+        ).fetchall()
+
+    # -- inverted index --------------------------------------------------
+    def postings_for_doc(self, tokens: Sequence[str], doc_id: str) -> Dict[str, list]:
+        tr = self._t()
+        if tr is not None:
+            tr.postings_queries += 1
+        placeholders = ",".join("?" for _ in tokens)
+        rows = self._conn.execute(
+            "SELECT token, pos, char_start, char_end, byte_start, byte_end "
+            "FROM postings WHERE doc_id = ? AND token IN (" + placeholders + ") "
+            "ORDER BY pos",
+            (doc_id, *tokens),
+        ).fetchall()
+        if tr is not None:
+            tr.posting_rows_fetched += len(rows)
+        out: Dict[str, list] = {t: [] for t in tokens}
+        for token, pos, cs, ce, bs, be in rows:
+            out[token].append((pos, cs, ce, bs, be))
+        return out
+
+    # -- integrity / binding --------------------------------------------
+    def verify(
+        self, *, full: bool = True, sample: int = 0, check_sources: bool = True
+    ) -> List[str]:
+        """Check structural and content binding.
+
+        ``full`` re-tokenises every stored text and recomputes its posting
+        digest, so a database whose text was swapped without rebuild is
+        reported.  Returns a list of problem strings (empty means OK).
+        """
+        problems: List[str] = []
+        quick = self._conn.execute("PRAGMA quick_check").fetchone()
+        if not quick or quick[0] != "ok":
+            problems.append(f"quick_check: {quick[0] if quick else 'no result'}")
+        rows = self._conn.execute(
+            "SELECT doc_id, text, text_sha256, char_len, byte_len, token_count, "
+            "postings_digest, source_path, source_sha256 FROM documents "
+            "ORDER BY doc_id"
+        ).fetchall()
+        meta = meta_rows(self._conn)
+        if meta.get("doc_count") != str(len(rows)):
+            problems.append("meta doc_count does not match documents table")
+        checked = 0
+        fp_rows: List[Tuple[str, str, str]] = []
+        for doc_id, text, sha, clen, blen, tcount, pdigest, spath, ssha in rows:
+            fp_rows.append((doc_id, sha, pdigest))
+            if full or (sample and checked < sample):
+                checked += 1
+                if text_sha256(text) != sha:
+                    problems.append(f"{doc_id}: stored text does not match sha256")
+                if len(text) != clen or len(text.encode("utf-8")) != blen:
+                    problems.append(f"{doc_id}: stored length metadata mismatch")
+                toks = token_spans(text)
+                if len(toks) != tcount:
+                    problems.append(f"{doc_id}: token_count mismatch")
+                digest = _postings_digest(
+                    (t.pos, t.norm, t.char_start, t.char_end, t.byte_start,
+                     t.byte_end) for t in toks
+                )
+                if digest != pdigest:
+                    problems.append(f"{doc_id}: postings digest mismatch")
+                stored = self._conn.execute(
+                    "SELECT pos, token, char_start, char_end, byte_start, byte_end "
+                    "FROM postings WHERE doc_id = ? ORDER BY pos", (doc_id,)
+                ).fetchall()
+                recomputed = [
+                    (t.pos, t.norm, t.char_start, t.char_end, t.byte_start, t.byte_end)
+                    for t in toks
+                ]
+                if [tuple(r) for r in stored] != recomputed:
+                    problems.append(f"{doc_id}: posting rows differ from text")
+            if check_sources and ssha is not None and spath is not None:
+                try:
+                    actual = hashlib.sha256(Path(spath).read_bytes()).hexdigest()
+                except OSError as exc:
+                    problems.append(f"{doc_id}: source file unreadable: {exc}")
+                else:
+                    if actual != ssha:
+                        problems.append(
+                            f"{doc_id}: source file changed since indexing "
+                            f"(expected sha256 {ssha}, got {actual})"
+                        )
+        expected_fp = _fingerprint(fp_rows)
+        if expected_fp != meta.get("index_fingerprint"):
+            problems.append("index fingerprint does not match document set")
+        return problems
+
+    def check_source(self, doc_id: str, *, path: Optional[str] = None,
+                     text: Optional[str] = None) -> None:
+        """Bind an external file/text to this index entry.
+
+        Raises :class:`StaleSourceError` when the supplied content differs from
+        what was indexed.  The caller must then call :meth:`rebuild_document`
+        explicitly; nothing is silently re-pointed.
+        """
+        meta = self.doc_meta(doc_id)
+        if meta is None:
+            raise KeyError(doc_id)
+        if text is not None:
+            actual_sha = text_sha256(text)
+            what = "supplied text"
+        else:
+            p = Path(path or meta["source_path"])
+            raw = p.read_bytes()
+            actual_sha = hashlib.sha256(raw).hexdigest()
+            what = str(p)
+        if actual_sha != meta["text_sha256"]:
+            raise StaleSourceError(
+                f"document {doc_id!r} {what} sha256 {actual_sha} does not match "
+                f"indexed sha256 {meta['text_sha256']}; the document must be "
+                "rebuilt explicitly before it can be queried"
+            )
+
+
+def meta_rows(conn: sqlite3.Connection) -> Dict[str, str]:
+    return {k: v for k, v in conn.execute("SELECT key, value FROM meta")}
+
+
+def open_index(path: os.PathLike | str, *, verify: bool = True,
+               trace: Optional[AccessTrace] = None) -> Index:
+    """Reopen a built index from a new process.
+
+    Rejects databases whose fingerprint or document table is inconsistent.
+    """
+    idx = Index(path, trace=trace)
+    if verify:
+        # Internal consistency only: a stale *source* file is surfaced by
+        # verify(check_sources=True) and by Index.check_source, but it must not
+        # stop the index from being queried -- the stored text is still the
+        # content the index was built from.
+        problems = idx.verify(full=False, check_sources=False)
+        if problems:
+            idx.close()
+            raise IndexFormatError("; ".join(problems))
+    return idx
+
+
+# ---------------------------------------------------------------------------
+# explicit rebuild
+# ---------------------------------------------------------------------------
+
+def rebuild_document(
+    path: os.PathLike | str,
+    doc_id: str,
+    text: str,
+    *,
+    source_path: Optional[str] = None,
+    source_sha256: Optional[str] = None,
+) -> str:
+    """Replace one document's text and postings in place, atomically.
+
+    This is the only supported way to change document content.  The index
+    fingerprint changes, so pagination cursors issued against the old content
+    are rejected instead of silently skipping or duplicating windows.
+    """
+    from .lexer import token_spans as _spans
+
+    if not isinstance(text, str):
+        raise ValueError("text must be str")
+    target = Path(path)
+    conn = sqlite3.connect(str(target), isolation_level=None)
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT doc_id FROM documents WHERE doc_id = ?", (doc_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(doc_id)
+        sha = text_sha256(text)
+        toks = _spans(text)
+        digest = _postings_digest(
+            (t.pos, t.norm, t.char_start, t.char_end, t.byte_start, t.byte_end)
+            for t in toks
+        )
+        conn.execute("DELETE FROM postings WHERE doc_id = ?", (doc_id,))
+        conn.execute(
+            "UPDATE documents SET text=?, text_sha256=?, char_len=?, byte_len=?, "
+            "token_count=?, postings_digest=?, source_path=?, source_sha256=? "
+            "WHERE doc_id=?",
+            (text, sha, len(text), len(text.encode("utf-8")), len(toks), digest,
+             source_path, source_sha256, doc_id),
+        )
+        conn.executemany(
+            "INSERT INTO postings(token, doc_id, pos, char_start, char_end, "
+            "byte_start, byte_end) VALUES (?,?,?,?,?,?,?)",
+            [(t.norm, doc_id, t.pos, t.char_start, t.char_end, t.byte_start,
+              t.byte_end) for t in toks],
+        )
+        rows = conn.execute(
+            "SELECT doc_id, text_sha256, postings_digest FROM documents "
+            "ORDER BY doc_id"
+        ).fetchall()
+        fp = _fingerprint([tuple(r) for r in rows])
+        meta_now = dict(conn.execute("SELECT key, value FROM meta"))
+        generation = int(meta_now["generation"]) + 1
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='index_fingerprint'", (fp,)
+        )
+        conn.execute(
+            "UPDATE meta SET value=? WHERE key='generation'", (str(generation),)
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+    return fp
