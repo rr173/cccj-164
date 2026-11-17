@@ -1,4 +1,5 @@
-"""Command line interface: build, search, fsearch, snippet, stats, verify, rebuild, refresh.
+"""Command line interface: build, search, fsearch, snippet, stats, verify,
+rebuild, refresh, archive, inspect-archive, restore.
 
 Examples
 --------
@@ -11,6 +12,9 @@ Examples
     python -m nearidx verify corpus.nearidx --full
     python -m nearidx rebuild corpus.nearidx d1 --file docs/d1.txt
     python -m nearidx refresh corpus.nearidx batch.jsonl --retain-old 2
+    python -m nearidx archive corpus.nearidx corpus.nearidx.pkg
+    python -m nearidx inspect-archive corpus.nearidx.pkg
+    python -m nearidx restore corpus.nearidx.pkg restored.nearidx
 """
 
 from __future__ import annotations
@@ -21,6 +25,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from .archive import (
+    ArchiveError,
+    archive_index,
+    inspect_archive,
+    recover_restore,
+    restore_index,
+)
 from .db import (
     Document,
     IndexFormatError,
@@ -259,6 +270,56 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_archive(args: argparse.Namespace) -> int:
+    try:
+        report = archive_index(args.index, args.archive,
+                               overwrite=args.overwrite)
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"index error: {exc}\n")
+        return 2
+    except ArchiveError as exc:
+        sys.stderr.write(f"archive error: {exc}\n")
+        return 2
+    _emit(report.as_dict())
+    return 0
+
+
+def cmd_inspect_archive(args: argparse.Namespace) -> int:
+    try:
+        manifest = inspect_archive(args.archive, verify=not args.no_verify)
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"archive error: {exc}\n")
+        return 2
+    except ArchiveError as exc:
+        sys.stderr.write(f"archive error: {exc}\n")
+        return 2
+    _emit(manifest.as_dict())
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    try:
+        report = restore_index(args.archive, args.index)
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"archive error: {exc}\n")
+        return 2
+    except ArchiveError as exc:
+        sys.stderr.write(f"restore error: {exc}\n")
+        return 2
+    _emit(report.as_dict())
+    return 0
+
+
+def cmd_recover_restore(args: argparse.Namespace) -> int:
+    try:
+        existed = recover_restore(args.index)
+    except ArchiveError as exc:
+        sys.stderr.write(f"restore error: {exc}\n")
+        return 2
+    _emit({"path": args.index, "recovered": existed})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="nearidx", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -339,6 +400,45 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: keep the registry setting, initially 2; minimum 1)",
     )
     rf.set_defaults(func=cmd_refresh)
+
+    ar = sub.add_parser(
+        "archive",
+        help="stream the current generation, every retained generation and "
+        "the generation registry into one archive with a versioned manifest",
+    )
+    ar.add_argument("index")
+    ar.add_argument("archive")
+    ar.add_argument("--overwrite", action="store_true")
+    ar.set_defaults(func=cmd_archive)
+
+    ia = sub.add_parser(
+        "inspect-archive",
+        help="print and verify an archive's manifest without restoring it",
+    )
+    ia.add_argument("archive")
+    ia.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip hashing the member payload (manifest structure only)",
+    )
+    ia.set_defaults(func=cmd_inspect_archive)
+
+    rs = sub.add_parser(
+        "restore",
+        help="validate an archive and restore it to a new, non-existent index "
+        "path (identity, generations and fingerprints preserved)",
+    )
+    rs.add_argument("archive")
+    rs.add_argument("index")
+    rs.set_defaults(func=cmd_restore)
+
+    rr = sub.add_parser(
+        "recover-restore",
+        help="resolve an interrupted restore of INDEX (finish a complete "
+        "install or discard a partial one)",
+    )
+    rr.add_argument("index")
+    rr.set_defaults(func=cmd_recover_restore)
     return p
 
 

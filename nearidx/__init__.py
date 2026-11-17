@@ -1,5 +1,19 @@
 """Package entry points for the near-neighbour index."""
 
+from .archive import (
+    ArchiveError,
+    ArchiveExistsError,
+    ArchiveFormatError,
+    ArchiveManifest,
+    ArchiveManifestError,
+    ArchiveMember,
+    ArchiveReport,
+    RestoreReport,
+    archive_index,
+    inspect_archive,
+    recover_restore,
+    restore_index,
+)
 from .db import (
     AccessTrace,
     BuildReport,
@@ -62,6 +76,13 @@ from .solver import (
 
 __all__ = [
     "AccessTrace",
+    "ArchiveError",
+    "ArchiveExistsError",
+    "ArchiveFormatError",
+    "ArchiveManifest",
+    "ArchiveManifestError",
+    "ArchiveMember",
+    "ArchiveReport",
     "BuildReport",
     "Cursor",
     "CursorError",
@@ -86,6 +107,7 @@ __all__ = [
     "QueryError",
     "QuerySyntaxError",
     "RefreshReport",
+    "RestoreReport",
     "SearchPage",
     "SeqNode",
     "SolverLimitError",
@@ -93,8 +115,10 @@ __all__ = [
     "Token",
     "TokenNode",
     "Window",
+    "archive_index",
     "build_index",
     "federated_search",
+    "inspect_archive",
     "iter_tokens",
     "leaf_tokens",
     "load_federation_manifest",
@@ -104,8 +128,10 @@ __all__ = [
     "query_signature",
     "rebuild_document",
     "recover_generations",
+    "recover_restore",
     "refresh_index",
     "requirement_groups",
+    "restore_index",
     "search",
     "select_root_windows",
     "serialize_query",
