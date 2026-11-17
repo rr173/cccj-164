@@ -16,6 +16,14 @@ from .db import (
     recover_generations,
     text_sha256,
 )
+from .federate import (
+    FederatedPage,
+    FederatedWindow,
+    Federation,
+    FederationError,
+    federated_search,
+    load_federation_manifest,
+)
 from .lexer import Token, iter_tokens, single_query_token, token_spans
 from .query import (
     Cursor,
@@ -58,6 +66,10 @@ __all__ = [
     "Cursor",
     "CursorError",
     "Document",
+    "FederatedPage",
+    "FederatedWindow",
+    "Federation",
+    "FederationError",
     "GenerationExpiredError",
     "GenerationInfo",
     "Hit",
@@ -82,8 +94,10 @@ __all__ = [
     "TokenNode",
     "Window",
     "build_index",
+    "federated_search",
     "iter_tokens",
     "leaf_tokens",
+    "load_federation_manifest",
     "open_index",
     "parse_manifest",
     "parse_query",

@@ -38,8 +38,9 @@ No shortest-interval selection is performed below the root.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from .db import AccessTrace, Index
 from .query import (
@@ -545,6 +546,66 @@ def _window_from_hit(
     )
 
 
+def _stream_root_windows(
+    index: Index,
+    root: Node,
+    docs: Sequence[str],
+    leaves: Sequence[TokenNode],
+    distinct_tokens: Sequence[str],
+    total_leaves: int,
+    *,
+    max_hits: int,
+    trace: AccessTrace,
+    resume: Optional[Tuple[Optional[str], int]] = None,
+) -> Iterator[
+    Tuple[str, int, int, Tuple[int, ...], Hit, Dict[int, Tuple[int, int, int, int]]]
+]:
+    """Yield root windows of *docs* in delivery order, one at a time.
+
+    Each item is ``(doc_id, start, end, witness, hit, spans)`` where ``spans``
+    maps the document's token positions to their original char/byte spans, so
+    a delivered window can be materialised without re-fetching postings.  The
+    stream is lazy: a document is solved only when the caller pulls far
+    enough to reach it, so stopping early never touches later documents.
+
+    ``resume`` may be a ``(doc_id, skip)`` pair: streaming then starts at that
+    candidate document and skips its first ``skip`` windows, which an earlier
+    page already delivered.  A resume point that does not match this index
+    generation raises :class:`CursorError` -- the state belongs to a cursor
+    that was not issued against exactly this content.
+    """
+    resume_doc, resume_skip = resume if resume is not None else (None, 0)
+    start_at = 0
+    if resume_doc is not None:
+        i = bisect.bisect_left(docs, resume_doc)
+        if i >= len(docs) or docs[i] != resume_doc:
+            raise CursorError(
+                "cursor resume state does not match this index generation: "
+                f"{resume_doc!r} is not a candidate document"
+            )
+        start_at = i
+    for doc_id in docs[start_at:]:
+        on_resume_doc = resume_doc is not None and doc_id == resume_doc
+        trace.docs_considered += 1
+        rows_by_token = index.postings_for_doc(distinct_tokens, doc_id)
+        trace.docs_solved += 1
+        hits = solve_document(root, rows_by_token, max_hits=max_hits)
+        windows = select_root_windows(hits, total_leaves) if hits else []
+        if on_resume_doc and resume_skip > len(windows):
+            raise CursorError(
+                "cursor resume state does not match this index generation: "
+                f"document {resume_doc!r} has {len(windows)} root windows, "
+                f"the cursor skips {resume_skip}"
+            )
+        if not windows:
+            continue
+        spans = _span_by_position(leaves, rows_by_token)
+        for j, (start, end, witness, hit) in enumerate(windows):
+            if on_resume_doc and j < resume_skip:
+                continue
+            yield doc_id, start, end, witness, hit, spans
+
+
 def search(
     index: Index,
     root: Node,
@@ -601,21 +662,22 @@ def search(
     selected: List[Tuple[str, int, int, Tuple[int, ...], Hit]] = []
     # One window beyond the requested page is enough to prove ``has_more``.
     # ``docs`` is ordered by doc_id and windows within a doc are ordered by
-    # (start, end), so appending keeps the global delivery order without any
+    # (start, end), so pulling keeps the global delivery order without any
     # repeated sort.  Stopping there is safe: later docs have larger doc_ids,
     # and they cannot affect windows already selected because minimum-window
     # filtering is strictly per document.
     target = offset + limit + 1
-    for doc_id in docs:
-        trace.docs_considered += 1
-        rows_by_token = index.postings_for_doc(distinct_tokens, doc_id)
-        trace.docs_solved += 1
-        hits = solve_document(root, rows_by_token, max_hits=max_hits)
-        if not hits:
-            continue
-        windows = select_root_windows(hits, total_leaves)
-        for start, end, witness, hit in windows:
-            selected.append((doc_id, start, end, witness, hit))
+    for doc_id, start, end, witness, hit, _spans in _stream_root_windows(
+        index,
+        root,
+        docs,
+        leaves,
+        distinct_tokens,
+        total_leaves,
+        max_hits=max_hits,
+        trace=trace,
+    ):
+        selected.append((doc_id, start, end, witness, hit))
         if stop_early and len(selected) >= target:
             break
     page_items = selected[offset : offset + limit]

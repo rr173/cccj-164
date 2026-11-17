@@ -7,6 +7,7 @@
 ```bash
 python3 -m nearidx build demo.nearidx docs/*.txt --overwrite
 python3 -m nearidx search demo.nearidx 'NEAR(3,[pump,pump])' --limit 5
+python3 -m nearidx fsearch vendors.json 'NEAR(3,[pump,pump])' --limit 5
 python3 -m nearidx snippet demo.nearidx d1 --positions 0:2
 python3 -m nearidx verify demo.nearidx --full
 python3 -m nearidx rebuild demo.nearidx d1 --file docs/d1.txt
@@ -25,10 +26,24 @@ with open_index("demo.nearidx") as idx:
         print(w.doc_id, w.start, w.end, w.witness, w.snippet, w.leaves)
 ```
 
+联邦检索（一条查询同查多份索引）：
+
+```python
+from nearidx import Federation, federated_search, parse_query
+
+with Federation({"vendor-a": "a.nearidx", "vendor-b": "b.nearidx"}) as fed:
+    page = federated_search(fed, parse_query("NEAR(3,[pump,pump])"), limit=10)
+    for w in page.windows:  # 按 (doc_id, source_name, start, end) 全局排序
+        print(w.source_name, w.doc_id, w.start, w.end, w.witness, w.snippet)
+    while page.has_more:  # 游标跨进程、跨刷新续翻各自固定的代
+        page = federated_search(fed, parse_query("NEAR(3,[pump,pump])"),
+                                cursor=page.next_cursor)
+```
+
 运行测试与演示：
 
 ```bash
-python3 -m unittest discover -s nearidx/tests -t .   # 84 个测试
+python3 -m unittest discover -s nearidx/tests -t .   # 124 个测试
 python3 -m nearidx.factcheck                         # 主例与嵌套例的落盘演示
 python3 examples/scale_demo.py 2000                   # 大量无关文档 + 访问证据
 ```
@@ -139,6 +154,24 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 - 一个 `Index` 句柄始终服务它打开时的那一代；要看新代请重新 `open_index`。`idx.generations()` 列出当前代与所有保留代，`idx.verify(full=True, generations=True)`（CLI `verify --full --generations`）会逐代校验数据与指纹绑定。
 - 与 `rebuild_document` 的区别：单篇重建仍是原地原子替换、使旧游标失效；批量刷新才发布新代并保留旧代。`build_index(overwrite=True)` 是全新索引，会丢弃上一代际状态。
 
+## 联邦检索（多来源同查）
+
+审核场景里同一条 `NEAR`/`SEQ` 查询常常要同时查阅多个供应商批次。`nearidx fsearch MANIFEST.json QUERY`（Python 侧 `Federation` + `federated_search`）把若干份**互相独立**的索引当成一个整体来查：清单是稳定来源名到索引文件的映射，结果按 `(doc_id, source_name, start, end)` 全局排序分页，每个窗口保留来源名与原有的窗口/见证/原文跨度。不同来源出现相同 `doc_id` 是**不同的结果**，全部保留。
+
+清单是一个 JSON 对象（相对路径相对清单所在目录解析）：
+
+```json
+{"vendor-a": "indexes/a.nearidx", "vendor-b": "indexes/b.nearidx"}
+```
+
+- **只读**：联邦检索只通过 `open_index` 只读打开各来源，从不修改任何索引内容。任一来源缺失、格式无效或清单非法（重复来源名、空清单、非字符串路径……）都会让整次调用明确失败，绝不悄悄跳过来源后返回看似完整的部分结果。
+- **代际固定**：第一页开始时分别固定每个来源实际打开的索引代；返回的游标逐来源记录索引身份（`index_id`）、固定代指纹和续翻位置。之后的游标跨进程、跨重开都继续读这些代——即使其中一份或多份索引已经 `refresh` 出新代。任一来源的固定代被清理出保留范围时，整次调用报 `GenerationExpiredError`，不给部分结果。
+- **游标绑定**：游标同时绑定查询、页大小、来源名集合与每个来源的索引身份。更换来源清单（增删来源）、把来源名指向另一索引、或更换查询，旧游标都被明确拒绝（`CursorError`）；游标自带页大小，续翻时忽略新的 `--limit`。
+- **流式归并**：每个来源的窗口流本身就按全局键有序，联邦层做 k 路归并——凑满当前页外加判定 `has_more` 所需的一个窗口即返回，绝不先把所有来源的全部命中读入内存再排序；续翻页同样只保留本页窗口和逐来源的续翻位置（每页每来源至多重解一个边界文档）。正文只在窗口真正交付时读取。
+- **语义一致**：窗口由与单索引 `search` 完全相同的求解器、根最小窗口、见证与原文切片机制产生；测试用单索引结果逐项对照（含 `OR` 未使用叶、多字节原文跨度）。
+
+每页的 `sources` 字段记录本页实际读取的逐来源 `{path, index_id, generation, fingerprint}`，`trace` 字段给出逐来源的访问证据（候选数、求解数、正文读取列表），便于审计"没有跨代混合、没有整库收集"。
+
 ## 模块
 
 | 文件 | 职责 |
@@ -148,11 +181,13 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 | `nearidx/db.py` | 建库、schema、只读打开、倒排访问、完整性校验、显式重建、代际注册表与崩溃恢复 |
 | `nearidx/refresh.py` | 清单解析/校验、整批发布为新索引代、保留清理 |
 | `nearidx/solver.py` | 需求组候选、候选窗口驱动求解、根最小窗口、分页 |
-| `nearidx/cli.py` | `build/search/snippet/stats/verify/rebuild/refresh` |
+| `nearidx/federate.py` | 联邦清单、来源打开、跨来源全局归并分页与游标绑定 |
+| `nearidx/cli.py` | `build/search/fsearch/snippet/stats/verify/rebuild/refresh` |
 | `nearidx/factcheck.py` | 可执行的主例/嵌套例演示 |
 | `nearidx/tests/oracle.py` | 独立暴力 oracle：枚举每个叶的所有词位分配后按公开规则筛选 |
 | `nearidx/tests/test_semantics.py` | 47 个语义测试（含随机化差分测试） |
 | `nearidx/tests/test_refresh.py` | 37 个批量刷新测试：代际发布、游标绑定、保留清理、崩溃恢复 |
+| `nearidx/tests/test_federate.py` | 40 个联邦检索测试：全局归并、代际固定、游标拒绝、流式证据 |
 | `examples/scale_demo.py` | 大量无关文档下的访问证据与超小分页演示 |
 
 ## 测试覆盖
@@ -162,6 +197,7 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 - 空文档、纯分隔符文档、多字节来源切片（emoji + 非 ASCII）。
 - 超小分页（1/2/3）、游标拒绝换查询与重建。
 - 批量刷新：新增/替换/删除同批发布；旧游标跨重开、跨进程读完原代；无效批次整批拒绝且索引不变；保留代清理后旧游标报过期；发布在每一步被杀后恢复为完整旧代或新代；单篇重建与普通查询行为不变。
+- 联邦检索：多来源交错（含相同 doc_id）的全局顺序与每页边界；第一页后只刷新一个索引，旧游标跨进程读完各自原代、新查询看到当前代；更换来源映射、重复来源名、缺失/损坏索引、任一来代际过期都整次拒绝；1500 篇全命中文档上首页只求解 ≤5 篇文档；联邦窗口与单索引 `search` 逐项一致。
 - 新进程 `python -I` 重开索引并查询。
 - 篡改正文/倒排检测、来源文件变动的显式报错、显式重建后的重新绑定。
 - 独立 oracle：固定小文本 × 固定查询集合、随机文本 × 随机查询树（150 组），同时对比**原始命中**与**根窗口**；另对根窗口线性选择做 200 组随机 O(n²) 交叉校验。
@@ -170,6 +206,7 @@ NEAR(width, [expr, ...])  # 无序；实际用到的位置集合两两不交；�
 ## 已知边界
 
 - 单个中间节点的部分命中数超过 `max_hits`（默认 2,000,000）会抛 `SolverLimitError`，提示收窄查询；不做静默截断。
-- 分页游标绑定一个索引代：该代仍保留时可跨进程续翻；被清理后报 `GenerationExpiredError`。游标不是“快照句柄”之外的实时同步机制，`rebuild_document` 原地改写仍使旧游标失效。
+- 分页游标绑定一个索引代：该代仍保留时可跨进程续翻；被清理后报 `GenerationExpiredError`。游标不是”快照句柄”之外的实时同步机制，`rebuild_document` 原地改写仍使旧游标失效。
+- 联邦游标绑定的是”查询 + 页大小 + 来源名集合 + 每个来源的索引身份与固定代”：来源清单或查询有任何变化都会被拒绝；联邦层自身不持有跨调用的状态，每次翻页按游标重开各来源的固定代。
 - 未实现并发写：`rebuild_document` 使用 `BEGIN IMMEDIATE` 做单次原子替换，构建走临时文件 + 原子 rename，批量刷新走完整新文件 + 日志 + 原子 rename；崩溃恢复假设没有另一个写者同时进行（恢复无法区分“崩溃的发布”和“进行中的发布”）。
 - 批量刷新按整库构建新代文件，发布成本随语料大小线性增长；换来的是发布与恢复路径完全复用构建逻辑。
